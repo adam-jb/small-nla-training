@@ -1,0 +1,27 @@
+--- patches/vllm_lens_fast_steering_hook_and_batched_rpc_20261011/easynla_patched/_activations_plugin.py	2026-10-11 10:51:31
++++ patches/vllm_lens_fast_steering_hook_and_batched_rpc_20261011/ours/_activations_plugin.py	2026-10-11 10:51:26
+@@ -268,9 +268,10 @@
+         self.collective_rpc("install_hooks")
+         self._hooks_installed = True  # type: ignore[reportAttributeAccessIssue]
+ 
+-    # Send steering data to workers before generation.
+-    for sid, payload in steering_payloads.items():
+-        self.collective_rpc("set_steering_data", args=(sid, payload))
++    # Send steering data to workers before generation: ONE rpc for the whole batch (FAST PATH, 11 Oct 2026; one rpc
++    # per request cost ~30 ms each = ~2 min per 4,000 prompts on a multiprocess engine).
++    if steering_payloads:
++        self.collective_rpc("set_steering_data_batch", args=(steering_payloads,))
+ 
+     assert _original_llm_generate is not None
+     outputs = _original_llm_generate(self, prompts, sampling_params, **kwargs)
+@@ -287,8 +288,8 @@
+                 output.activations = activations
+ 
+     # Clean up steering data.
+-    for sid in steering_payloads:
+-        self.collective_rpc("clear_steering_data", args=(sid,))
++    if steering_payloads:
++        self.collective_rpc("clear_steering_data_batch", args=(list(steering_payloads),))
+ 
+     return outputs
+ 

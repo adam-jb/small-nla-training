@@ -1,0 +1,324 @@
+--- patches/vllm_lens_fast_steering_hook_and_batched_rpc_20261011/easynla_patched/_worker_ext.py	2026-10-11 10:51:31
++++ patches/vllm_lens_fast_steering_hook_and_batched_rpc_20261011/ours/_worker_ext.py	2026-10-11 10:51:24
+@@ -199,177 +199,154 @@
+                     _e["positions"].append(int(abs_pos))
+ 
+ 
+-def _hook_inner(
+-    extension: HiddenStatesExtension,
+-    layer_idx: int,
+-    output: torch.Tensor | tuple[torch.Tensor, ...],
+-) -> torch.Tensor | tuple[torch.Tensor, ...] | None:
+-    """Core hook logic, separated so _make_hook can wrap it in try/except."""
+-    if not is_forward_context_available():
+-        return None
++def _step_state(extension: HiddenStatesExtension, ctx: Any, attn_metadata: Any) -> dict:
++    """Per-forward-pass state, built once at the first hooked layer and reused by every other layer.
+ 
++    FAST PATH (11 Oct 2026). The old hook redid all of this on every layer of every step: a Python loop over all
++    running requests (config lookup, list copy) x n_layers, plus 2-3 blocking ``.item()`` syncs per steered request
++    at the steered layer. At ~260 running requests and 64 layers that is ~17k lookups and ~800 GPU syncs per decode
++    step, though position-indexed steering (the NLA case) only ever writes during the prompt.
++    Keyed by identity of the ForwardContext object, which we hold a reference to (so its id cannot be reused).
++    """
++    st = extension.__dict__.get("_fast_step")
++    if st is not None and st["ctx"] is ctx:
++        return st
+     runner = extension.model_runner
+     num_reqs = runner.input_batch.num_reqs
+-    if num_reqs == 0:
+-        return None
+-
+     req_ids = runner.input_batch.req_ids
+-
+-    ctx = get_forward_context()
+-    attn_metadata = ctx.attn_metadata
+-    if attn_metadata is None:
+-        return None
+-    if isinstance(attn_metadata, list):
+-        attn_metadata = attn_metadata[0]
+-        if attn_metadata is None:
+-            return None
+-    # Hybrid models (e.g. Qwen3-Next with GatedDeltaNet) have multiple
+-    # attention metadata entries — some (like GDNAttentionMetadata) lack
+-    # query_start_loc.  Find one that has it.
+-    query_start_loc: Int[torch.Tensor, "num_reqs_plus1"] | None = None  # type: ignore[reportUndefinedVariable]
+-    for _meta in attn_metadata.values():
+-        if hasattr(_meta, "query_start_loc"):
+-            query_start_loc = getattr(_meta, "query_start_loc")
+-            break
+-    if query_start_loc is None:
+-        logger.warning(
+-            "No attention metadata with query_start_loc found "
+-            "(keys: %s). Skipping hook for this step.",
+-            list(attn_metadata.keys()),
+-        )
+-        return None
+-
+-    # --- Phase 1: detect steering requests --------------------------
+     per_req_steering: list[list[SteeringVector]] = []
+     per_req_log_key: list = []
+-    needs_steering = False
++    steer_layers: set[int] = set()
++    capture: list[tuple[int, str, Any]] = []  # (i, req_id, output_residual_stream)
+     for i in range(num_reqs):
+         req_id = req_ids[i]
+         req_state = runner.requests.get(req_id)
+-        extra = (
+-            req_state.sampling_params.extra_args
+-            if req_state and req_state.sampling_params
+-            else None
+-        )
++        extra = (req_state.sampling_params.extra_args
++                 if req_state and req_state.sampling_params else None)
+         configs = _find_steering_configs(extension, req_id, extra)
+         per_req_steering.append(configs)
+         _sid = (extra or {}).get("_steering_id")
+         per_req_log_key.append(_sid or req_id)
+-        # ORPHAN: the request claims steering (_steering_id set) but the
+-        # payload is gone from _steering_data — the exact silent-lost-
+-        # injection mechanism. Count once per forward (layer 0 only; this
+-        # hook fires per layer).
+-        if _sid is not None and not configs and layer_idx == 0:
+-            _nla_steer_entry(_sid)["orphaned"] += 1
+-        if configs:
+-            needs_steering = True
++        if _sid is not None and not configs:
++            _nla_steer_entry(_sid)["orphaned"] += 1  # once per forward, as before
++        for cfg in configs:
++            steer_layers.update(cfg.layer_index_map)
++        if extra and extension._should_capture:
++            ors = extra.get("output_residual_stream")
++            if ors is not None:
++                capture.append((i, req_id, ors))
++    capture_all = any(not isinstance(o, list) for _, _, o in capture)
++    capture_layers = set() if capture_all else {l for _, _, o in capture for l in o}
++    query_start_loc = None
++    for _meta in attn_metadata.values():
++        if hasattr(_meta, "query_start_loc"):
++            query_start_loc = getattr(_meta, "query_start_loc")
++            break
++    seq_lens: Any = getattr(attn_metadata, "seq_lens", None)
++    if seq_lens is None and hasattr(attn_metadata, "values"):
++        for _meta5 in attn_metadata.values():
++            if getattr(_meta5, "seq_lens", None) is not None:
++                seq_lens = _meta5.seq_lens
++                break
++    st = {"ctx": ctx, "num_reqs": num_reqs, "req_ids": req_ids, "steer": per_req_steering,
++          "log_key": per_req_log_key, "steer_layers": steer_layers, "capture": capture,
++          "capture_all": capture_all and bool(capture), "capture_layers": capture_layers,
++          "qsl_t": query_start_loc, "sl_t": seq_lens, "qsl": None, "sl": None}
++    extension._fast_step = st
++    return st
+ 
+-    # --- Phase 2: apply steering ------------------------------------
+-    modified_output: torch.Tensor | tuple[torch.Tensor, ...] | None = None
+-    # Only do the clone/full-stream work when some config actually targets
+-    # THIS layer (the hook fires on every layer; configs usually target one).
+-    if needs_steering:
+-        needs_steering = any(
+-            layer_idx in cfg.layer_index_map
+-            for cfgs in per_req_steering
+-            for cfg in cfgs
+-        )
+-    if needs_steering:
+-        if isinstance(output, tuple):
+-            modified_output = (output[0].clone(), output[1])
+-            target = modified_output[0]
+-            # Decoder layers that return (hidden_states, residual) defer the
+-            # residual add to the next layer's fused add-RMSNorm: the TRUE
+-            # stream is output[0] + output[1]. Writing the steering vector
+-            # into output[0] lands it in the stream, but norm_match must be
+-            # anchored to the FULL stream — same convention as the capture
+-            # path below (capture_src[0] + capture_src[1]). Norm-matching
+-            # against output[0] alone mis-scales the injection (observed as
+-            # ~40% GRPO clip-frac at identical weights vs an HF forward).
+-            norm_ref = (
+-                output[0] + output[1] if output[1] is not None else output[0]
+-            )
+-        else:
+-            modified_output = output.clone()
+-            target = modified_output
+-            norm_ref = target
+ 
+-        # Retrieve seq_lens for absolute position calculation.
+-        # seq_lens may be a tensor or a list depending on vLLM version.
+-        seq_lens: Any = getattr(attn_metadata, "seq_lens", None)
+-        if seq_lens is None and hasattr(attn_metadata, "values"):
+-            # vLLM v1: attn_metadata is a dict of per-KV-group metadata — the
+-            # bare getattr above always returned None here, sending every chunk
+-            # into the abs_start=0 fallback and silently losing/mis-positioning
+-            # steering on split prefills (patch_vllm_lens fix (5)).
+-            for _meta5 in attn_metadata.values():
+-                if getattr(_meta5, "seq_lens", None) is not None:
+-                    seq_lens = _meta5.seq_lens
+-                    break
++def _cpu_positions(st: dict) -> None:
++    """One sync per step for query_start_loc and seq_lens (instead of .item() per request)."""
++    if st["qsl"] is None:
++        st["qsl"] = st["qsl_t"].tolist()
++        sl = st["sl_t"]
++        st["sl"] = (sl.tolist() if isinstance(sl, torch.Tensor) else list(sl)) if sl is not None else None
+ 
+-        for i in range(num_reqs):
+-            if not per_req_steering[i]:
+-                continue
+-            start = int(query_start_loc[i].item())
+-            end = int(query_start_loc[i + 1].item())
+-            n_query = end - start
+-            # Absolute position of the first token in this forward pass
+-            if seq_lens is not None:
+-                sl = seq_lens[i]
+-                sl_val = sl.item() if isinstance(sl, torch.Tensor) else int(sl)
+-                abs_start = int(sl_val - n_query)
+-            else:
+-                abs_start = 0  # fallback: treat as prefill from position 0
+-            _apply_steering(
+-                per_req_steering[i], layer_idx, target, start, end, abs_start,
+-                norm_ref,
+-                log_key=per_req_log_key[i],
+-            )
++
++def _needs_write(configs: list[SteeringVector], layer_idx: int, abs_start: int, abs_end: int) -> bool:
++    """False only when every config on this layer is position-indexed and none of its positions is in this slice."""
++    for cfg in configs:
++        if layer_idx not in cfg.layer_index_map:
++            continue
++        vec = cfg.activations[cfg.layer_index_map[layer_idx]]
++        if vec.dim() == 1:
++            return True
++        pos = cfg.position_indices if cfg.position_indices is not None else range(vec.shape[0])
++        if any(abs_start <= p < abs_end for p in pos):
++            return True
++    return False
+ 
+-    # --- Phase 3: capture activations (rank 0 only) -----------------
+-    if getattr(extension, "_should_capture", True):
+-        capture_src = modified_output if modified_output is not None else output
+-        hidden_states: Float[torch.Tensor, "total_tokens hidden_dim"]  # type: ignore[reportUndefinedVariable]
+-        if isinstance(capture_src, tuple):
+-            if capture_src[1] is not None:
+-                hidden_states = capture_src[0] + capture_src[1]
+-            else:
+-                hidden_states = capture_src[0]
+-        else:
+-            hidden_states = capture_src
+ 
+-        for i in range(num_reqs):
+-            req_id = req_ids[i]
+-            req_state = runner.requests.get(req_id)
+-            if req_state is None or req_state.sampling_params is None:
+-                continue
+-            extra = req_state.sampling_params.extra_args
+-            if not extra:
+-                continue
+-
+-            output_residual_stream = extra.get("output_residual_stream")
+-            if output_residual_stream is None:
+-                continue
+-            if (
+-                isinstance(output_residual_stream, list)
+-                and layer_idx not in output_residual_stream
+-            ):
++def _hook_inner(
++    extension: HiddenStatesExtension,
++    layer_idx: int,
++    output: torch.Tensor | tuple[torch.Tensor, ...],
++) -> torch.Tensor | tuple[torch.Tensor, ...] | None:
++    """Core hook logic (fast path: see _step_state). Same results as the per-layer version."""
++    if not is_forward_context_available():
++        return None
++    if extension.model_runner.input_batch.num_reqs == 0:
++        return None
++    ctx = get_forward_context()
++    attn_metadata = ctx.attn_metadata
++    if attn_metadata is None:
++        return None
++    if isinstance(attn_metadata, list):
++        attn_metadata = attn_metadata[0]
++        if attn_metadata is None:
++            return None
++    st = _step_state(extension, ctx, attn_metadata)
++    do_steer = layer_idx in st["steer_layers"]
++    do_capture = st["capture_all"] or layer_idx in st["capture_layers"]
++    if not do_steer and not do_capture:
++        return None  # the common case: 63 of 64 layers, every step
++    if st["qsl_t"] is None:
++        logger.warning("No attention metadata with query_start_loc found (keys: %s). Skipping hook for this step.",
++                       list(attn_metadata.keys()))
++        return None
++    _cpu_positions(st)
++    qsl, sl = st["qsl"], st["sl"]
++
++    # --- Phase 2: apply steering (only requests with a write in this slice) ---
++    modified_output: torch.Tensor | tuple[torch.Tensor, ...] | None = None
++    if do_steer:
++        work = []
++        for i, configs in enumerate(st["steer"]):
++            if not configs:
+                 continue
++            start, end = qsl[i], qsl[i + 1]
++            abs_start = int(sl[i] - (end - start)) if sl is not None else 0
++            if _needs_write(configs, layer_idx, abs_start, abs_start + end - start):
++                work.append((i, start, end, abs_start))
++        if work:
++            if isinstance(output, tuple):
++                modified_output = (output[0].clone(), output[1])
++                target = modified_output[0]
++                # (hidden_states, residual) layers: the true stream is the sum; norm_match is anchored to it
++                norm_ref = output[0] + output[1] if output[1] is not None else output[0]
++            else:
++                modified_output = output.clone()
++                target = modified_output
++                norm_ref = target
++            for i, start, end, abs_start in work:
++                _apply_steering(st["steer"][i], layer_idx, target, start, end, abs_start, norm_ref,
++                                log_key=st["log_key"][i])
+ 
+-            start = query_start_loc[i].item()
+-            end = query_start_loc[i + 1].item()
+-            # Blocking .cpu() benchmarked faster than non_blocking + event sync
+-            activation: Float[torch.Tensor, "seq_len hidden_dim"] = hidden_states[  # type: ignore[reportUndefinedVariable]
+-                start:end
+-            ].cpu()
++    # --- Phase 3: capture activations (rank 0 only) ---
++    if do_capture and st["capture"]:
++        capture_src = modified_output if modified_output is not None else output
++        if isinstance(capture_src, tuple):
++            hidden_states = capture_src[0] + capture_src[1] if capture_src[1] is not None else capture_src[0]
++        else:
++            hidden_states = capture_src
++        for i, req_id, ors in st["capture"]:
++            if isinstance(ors, list) and layer_idx not in ors:
++                continue
++            activation = hidden_states[qsl[i]:qsl[i + 1]].cpu()
++            layer_states = extension._captured_states.setdefault(req_id, {})
++            layer_states.setdefault(layer_idx, []).append(activation)
+ 
+-            if req_id not in extension._captured_states:
+-                extension._captured_states[req_id] = {}
+-            layer_states = extension._captured_states[req_id]
+-            if layer_idx not in layer_states:
+-                layer_states[layer_idx] = []
+-            layer_states[layer_idx].append(activation)
+-
+     return modified_output
+ 
+ 
+@@ -498,6 +475,16 @@
+ 
+         self._steering_data[key] = vectors
+ 
++    def set_steering_data_batch(self, payloads: dict[str, bytes]) -> None:
++        """Batched set_steering_data: one rpc for a whole generate() call."""
++        for key, pickled_data in payloads.items():
++            self.set_steering_data(key, pickled_data)
++
++    def clear_steering_data_batch(self, keys: list[str]) -> None:
++        """Batched clear_steering_data."""
++        for key in keys:
++            self._steering_data.pop(key, None)
++
+     def clear_steering_data(self, key: str) -> None:
+         """Remove steering data for a completed request."""
+         self._steering_data.pop(key, None)
